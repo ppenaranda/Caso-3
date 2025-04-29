@@ -123,7 +123,7 @@ public class ServidorPrincipal {
 
     private static void generarYGuardarLlavesRSA() throws IOException, NoSuchAlgorithmException {
         KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
-        keyGen.initialize(1024);
+        keyGen.initialize(2048); // Aumentado a 2048 bits para mayor seguridad
         KeyPair keyPair = keyGen.generateKeyPair();
 
         PrivateKey privateKey = keyPair.getPrivate();
@@ -143,6 +143,7 @@ public class ServidorPrincipal {
     private static class ClientHandler implements Runnable {
         private Socket clientSocket;
         private CountDownLatch latch;
+        private int modoCifrado;
 
         public ClientHandler(Socket clientSocket) {
             this.clientSocket = clientSocket;
@@ -160,155 +161,21 @@ public class ServidorPrincipal {
                 PrivateKey privateKeyRSA = cargarClavePrivada(CLAVE_PRIVADA_PATH);
                 PublicKey publicKeyRSA = cargarClavePublica(CLAVE_PUBLICA_PATH);
                 
-                // Establecimiento de sesión con Diffie-Hellman
-                // 1. Generar par de claves DH para el servidor
-                KeyPairGenerator keyGen = KeyPairGenerator.getInstance("DH");
-                keyGen.initialize(1024);
-                KeyPair keyPair = keyGen.generateKeyPair();
-                
-                // 2. Recibir clave pública DH del cliente
-                ObjectInputStream ois = new ObjectInputStream(clientSocket.getInputStream());
-                PublicKey publicKeyCliente = (PublicKey) ois.readObject();
-                System.out.println("Clave pública DH del cliente recibida.");
-                
-                // 3. Enviar clave pública DH del servidor
-                ObjectOutputStream oos = new ObjectOutputStream(clientSocket.getOutputStream());
-                oos.writeObject(keyPair.getPublic());
-                oos.flush();
-                System.out.println("Clave pública DH enviada al cliente.");
-                
-                // 4. Generar llave maestra
-                KeyAgreement keyAgreement = KeyAgreement.getInstance("DH");
-                keyAgreement.init(keyPair.getPrivate());
-                keyAgreement.doPhase(publicKeyCliente, true);
-                byte[] llaveMaestra = keyAgreement.generateSecret();
-                
-                // 5. Generar digest SHA-512 de la llave maestra
-                MessageDigest sha = MessageDigest.getInstance("SHA-512");
-                byte[] digest = sha.digest(llaveMaestra);
-                
-                // 6. Partir el digest en dos mitades
-                byte[] aesKeyBytes = Arrays.copyOfRange(digest, 0, 32); // Primeros 256 bits para AES
-                byte[] hmacKeyBytes = Arrays.copyOfRange(digest, 32, 64); // Últimos 256 bits para HMAC
-                
-                // 7. Crear llaves
-                SecretKeySpec aesKey = new SecretKeySpec(aesKeyBytes, "AES");
-                SecretKeySpec hmacKey = new SecretKeySpec(hmacKeyBytes, "HmacSHA256");
-                
-                // Enviar tabla de servicios cifrada
-                DataOutputStream dos = new DataOutputStream(clientSocket.getOutputStream());
+                // Recibir el modo de cifrado elegido por el cliente
                 DataInputStream dis = new DataInputStream(clientSocket.getInputStream());
+                DataOutputStream dos = new DataOutputStream(clientSocket.getOutputStream());
                 
-                // Preparar tabla de servicios
-                StringBuilder tablaBuilder = new StringBuilder();
-                for (Map.Entry<String, String> entry : servicios.entrySet()) {
-                    String[] partes = entry.getValue().split("\\|");
-                    tablaBuilder.append(entry.getKey()).append(":").append(partes[0]).append("\n");
+                modoCifrado = dis.readInt();
+                System.out.println("Cliente eligió modo de cifrado: " + 
+                                  (modoCifrado == 1 ? "Simétrico (AES)" : "Asimétrico (RSA)"));
+                
+                if (modoCifrado == 1) {
+                    // MODO SIMÉTRICO (AES)
+                    procesarConsultaAES(privateKeyRSA, publicKeyRSA, dis, dos);
+                } else {
+                    // MODO ASIMÉTRICO (RSA)
+                    procesarConsultaRSA(privateKeyRSA, publicKeyRSA, dis, dos);
                 }
-                String tablaServicios = tablaBuilder.toString().trim();
-                byte[] tablaBytes = tablaServicios.getBytes();
-                
-                // Firmar la tabla con RSA
-                long tiempoInicioFirma = System.nanoTime();
-                Signature signature = Signature.getInstance("SHA256withRSA");
-                signature.initSign(privateKeyRSA);
-                signature.update(tablaBytes);
-                byte[] firma = signature.sign();
-                long tiempoFinFirma = System.nanoTime();
-                tiempos.get("firma").add((tiempoFinFirma - tiempoInicioFirma) / 1_000_000);
-                
-                // Cifrar tabla con AES
-                long tiempoInicioCifrado = System.nanoTime();
-                Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-                byte[] iv = new byte[16];
-                new SecureRandom().nextBytes(iv);
-                cipher.init(Cipher.ENCRYPT_MODE, aesKey, new IvParameterSpec(iv));
-                byte[] tablaCifrada = cipher.doFinal(tablaBytes);
-                long tiempoFinCifrado = System.nanoTime();
-                tiempos.get("cifrado_tabla").add((tiempoFinCifrado - tiempoInicioCifrado) / 1_000_000);
-                
-                // Enviar IV, longitud y tabla cifrada
-                dos.write(iv);
-                dos.writeInt(tablaCifrada.length);
-                dos.write(tablaCifrada);
-                
-                // Enviar longitud y firma
-                dos.writeInt(firma.length);
-                dos.write(firma);
-                
-                // Calcular y enviar HMAC
-                Mac mac = Mac.getInstance("HmacSHA256");
-                mac.init(hmacKey);
-                byte[] hmacTabla = mac.doFinal(tablaCifrada);
-                dos.write(hmacTabla);
-                
-                System.out.println("Tabla de servicios cifrada enviada al cliente.");
-                
-                // Recibir consulta del cliente
-                // Leer IV
-                byte[] ivCliente = new byte[16];
-                dis.readFully(ivCliente);
-                IvParameterSpec ivSpecCliente = new IvParameterSpec(ivCliente);
-                
-                // Leer mensaje cifrado
-                int longitudMensaje = dis.readInt();
-                byte[] mensajeCifrado = new byte[longitudMensaje];
-                dis.readFully(mensajeCifrado);
-                System.out.println("Consulta cifrada recibida.");
-                
-                // Leer HMAC
-                byte[] hmacRecibido = new byte[mac.getMacLength()];
-                dis.readFully(hmacRecibido);
-                
-                // Verificar HMAC
-                long tiempoInicioVerificacion = System.nanoTime();
-                byte[] hmacCalculado = mac.doFinal(mensajeCifrado);
-                boolean hmacValido = Arrays.equals(hmacRecibido, hmacCalculado);
-                long tiempoFinVerificacion = System.nanoTime();
-                tiempos.get("verificacion_consulta").add((tiempoFinVerificacion - tiempoInicioVerificacion) / 1_000_000);
-                
-                if (!hmacValido) {
-                    System.out.println("Error: HMAC no coincide");
-                    dos.writeUTF("Error en la consulta");
-                    return;
-                }
-                
-                // Descifrar consulta
-                cipher.init(Cipher.DECRYPT_MODE, aesKey, ivSpecCliente);
-                byte[] consultaDescifrada = cipher.doFinal(mensajeCifrado);
-                String idServicio = new String(consultaDescifrada);
-                System.out.println("Consulta procesada: " + idServicio);
-                
-                // Procesar consulta
-                String respuesta = servicios.getOrDefault(idServicio, "-1|-1");
-                
-                // Cifrado simétrico (AES)
-                long tiempoInicioCifradoSim = System.nanoTime();
-                byte[] ivRespuesta = new byte[16];
-                new SecureRandom().nextBytes(ivRespuesta);
-                cipher.init(Cipher.ENCRYPT_MODE, aesKey, new IvParameterSpec(ivRespuesta));
-                byte[] respuestaCifrada = cipher.doFinal(respuesta.getBytes());
-                long tiempoFinCifradoSim = System.nanoTime();
-                tiempos.get("cifrado_simetrico").add((tiempoFinCifradoSim - tiempoInicioCifradoSim) / 1_000_000);
-                
-                // Cifrado asimétrico (RSA) - Solo para comparación de tiempos
-                long tiempoInicioCifradoAsim = System.nanoTime();
-                Cipher cipherRSA = Cipher.getInstance("RSA");
-                cipherRSA.init(Cipher.ENCRYPT_MODE, publicKeyRSA);
-                byte[] respuestaCifradaRSA = cipherRSA.doFinal(respuesta.getBytes());
-                long tiempoFinCifradoAsim = System.nanoTime();
-                tiempos.get("cifrado_asimetrico").add((tiempoFinCifradoAsim - tiempoInicioCifradoAsim) / 1_000_000);
-                
-                // Enviar respuesta cifrada con AES
-                dos.write(ivRespuesta);
-                dos.writeInt(respuestaCifrada.length);
-                dos.write(respuestaCifrada);
-                
-                // Calcular y enviar HMAC de la respuesta
-                byte[] hmacRespuesta = mac.doFinal(respuestaCifrada);
-                dos.write(hmacRespuesta);
-                
-                System.out.println("Respuesta enviada al cliente: " + respuesta);
                 
                 clientSocket.close();
                 System.out.println("Conexión cerrada.");
@@ -324,6 +191,244 @@ public class ServidorPrincipal {
                 }
             }
         }
+        
+        private void procesarConsultaAES(PrivateKey privateKeyRSA, PublicKey publicKeyRSA,
+                                        DataInputStream dis, DataOutputStream dos) throws Exception {
+            // Establecimiento de sesión con Diffie-Hellman
+            // 1. Generar par de claves DH para el servidor
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("DH");
+            keyGen.initialize(2048);
+            KeyPair keyPair = keyGen.generateKeyPair();
+            
+            // 2. Recibir clave pública DH del cliente
+            ObjectInputStream ois = new ObjectInputStream(clientSocket.getInputStream());
+            PublicKey publicKeyCliente = (PublicKey) ois.readObject();
+            System.out.println("Clave pública DH del cliente recibida.");
+            
+            // 3. Enviar clave pública DH del servidor
+            ObjectOutputStream oos = new ObjectOutputStream(clientSocket.getOutputStream());
+            oos.writeObject(keyPair.getPublic());
+            oos.flush();
+            System.out.println("Clave pública DH enviada al cliente.");
+            
+            // 4. Generar llave maestra
+            KeyAgreement keyAgreement = KeyAgreement.getInstance("DH");
+            keyAgreement.init(keyPair.getPrivate());
+            keyAgreement.doPhase(publicKeyCliente, true);
+            byte[] llaveMaestra = keyAgreement.generateSecret();
+            
+            // 5. Generar digest SHA-512 de la llave maestra
+            MessageDigest sha = MessageDigest.getInstance("SHA-512");
+            byte[] digest = sha.digest(llaveMaestra);
+            
+            // 6. Partir el digest en dos mitades
+            byte[] aesKeyBytes = Arrays.copyOfRange(digest, 0, 32); // Primeros 256 bits para AES
+            byte[] hmacKeyBytes = Arrays.copyOfRange(digest, 32, 64); // Últimos 256 bits para HMAC
+            
+            // 7. Crear llaves
+            SecretKeySpec aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+            SecretKeySpec hmacKey = new SecretKeySpec(hmacKeyBytes, "HmacSHA256");
+            
+            // Preparar tabla de servicios
+            StringBuilder tablaBuilder = new StringBuilder();
+            for (Map.Entry<String, String> entry : servicios.entrySet()) {
+                String[] partes = entry.getValue().split("\\|");
+                tablaBuilder.append(entry.getKey()).append(":").append(partes[0]).append("\n");
+            }
+            String tablaServicios = tablaBuilder.toString().trim();
+            byte[] tablaBytes = tablaServicios.getBytes();
+            
+            // Firmar la tabla con RSA
+            long tiempoInicioFirma = System.nanoTime();
+            Signature signature = Signature.getInstance("SHA256withRSA");
+            signature.initSign(privateKeyRSA);
+            signature.update(tablaBytes);
+            byte[] firma = signature.sign();
+            long tiempoFinFirma = System.nanoTime();
+            tiempos.get("firma").add((tiempoFinFirma - tiempoInicioFirma) / 1_000_000);
+            
+            // Cifrar tabla con AES
+            long tiempoInicioCifrado = System.nanoTime();
+            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            byte[] iv = new byte[16];
+            new SecureRandom().nextBytes(iv);
+            cipher.init(Cipher.ENCRYPT_MODE, aesKey, new IvParameterSpec(iv));
+            byte[] tablaCifrada = cipher.doFinal(tablaBytes);
+            long tiempoFinCifrado = System.nanoTime();
+            tiempos.get("cifrado_tabla").add((tiempoFinCifrado - tiempoInicioCifrado) / 1_000_000);
+            
+            // Enviar IV, longitud y tabla cifrada
+            dos.write(iv);
+            dos.writeInt(tablaCifrada.length);
+            dos.write(tablaCifrada);
+            
+            // Enviar longitud y firma
+            dos.writeInt(firma.length);
+            dos.write(firma);
+            
+            // Calcular y enviar HMAC
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(hmacKey);
+            byte[] hmacTabla = mac.doFinal(tablaCifrada);
+            dos.write(hmacTabla);
+            
+            System.out.println("Tabla de servicios cifrada enviada al cliente.");
+            
+            // Recibir consulta del cliente
+            // Leer IV
+            byte[] ivCliente = new byte[16];
+            dis.readFully(ivCliente);
+            IvParameterSpec ivSpecCliente = new IvParameterSpec(ivCliente);
+            
+            // Leer mensaje cifrado
+            int longitudMensaje = dis.readInt();
+            byte[] mensajeCifrado = new byte[longitudMensaje];
+            dis.readFully(mensajeCifrado);
+            System.out.println("Consulta cifrada recibida.");
+            
+            // Leer HMAC
+            byte[] hmacRecibido = new byte[mac.getMacLength()];
+            dis.readFully(hmacRecibido);
+            
+            // Verificar HMAC
+            long tiempoInicioVerificacion = System.nanoTime();
+            byte[] hmacCalculado = mac.doFinal(mensajeCifrado);
+            boolean hmacValido = Arrays.equals(hmacRecibido, hmacCalculado);
+            long tiempoFinVerificacion = System.nanoTime();
+            tiempos.get("verificacion_consulta").add((tiempoFinVerificacion - tiempoInicioVerificacion) / 1_000_000);
+            
+            if (!hmacValido) {
+                System.out.println("Error: HMAC no coincide");
+                dos.writeUTF("Error en la consulta");
+                return;
+            }
+            
+            // Descifrar consulta
+            cipher.init(Cipher.DECRYPT_MODE, aesKey, ivSpecCliente);
+            byte[] consultaDescifrada = cipher.doFinal(mensajeCifrado);
+            String idServicio = new String(consultaDescifrada);
+            System.out.println("Consulta procesada: " + idServicio);
+            
+            // Procesar consulta
+            String respuesta = servicios.getOrDefault(idServicio, "-1|-1");
+            
+            // Cifrado simétrico (AES)
+            long tiempoInicioCifradoSim = System.nanoTime();
+            byte[] ivRespuesta = new byte[16];
+            new SecureRandom().nextBytes(ivRespuesta);
+            cipher.init(Cipher.ENCRYPT_MODE, aesKey, new IvParameterSpec(ivRespuesta));
+            byte[] respuestaCifrada = cipher.doFinal(respuesta.getBytes());
+            long tiempoFinCifradoSim = System.nanoTime();
+            tiempos.get("cifrado_simetrico").add((tiempoFinCifradoSim - tiempoInicioCifradoSim) / 1_000_000);
+            
+            // Enviar respuesta cifrada con AES
+            dos.write(ivRespuesta);
+            dos.writeInt(respuestaCifrada.length);
+            dos.write(respuestaCifrada);
+            
+            // Calcular y enviar HMAC de la respuesta
+            byte[] hmacRespuesta = mac.doFinal(respuestaCifrada);
+            dos.write(hmacRespuesta);
+            
+            System.out.println("Respuesta enviada al cliente: " + respuesta);
+        }
+        
+        private void procesarConsultaRSA(PrivateKey privateKeyRSA, PublicKey publicKeyRSA,
+        DataInputStream dis, DataOutputStream dos) throws Exception {
+try {
+// Recibir clave AES cifrada con RSA
+int longitudClaveAES = dis.readInt();
+byte[] claveAESCifrada = new byte[longitudClaveAES];
+dis.readFully(claveAESCifrada);
+
+// Descifrar la clave AES con la clave privada RSA del servidor
+Cipher rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+rsaCipher.init(Cipher.DECRYPT_MODE, privateKeyRSA);
+byte[] claveAESBytes = rsaCipher.doFinal(claveAESCifrada);
+SecretKey claveAES = new SecretKeySpec(claveAESBytes, "AES");
+System.out.println("Clave de sesión AES recibida y descifrada");
+
+// Preparar tabla de servicios
+StringBuilder tablaBuilder = new StringBuilder();
+for (Map.Entry<String, String> entry : servicios.entrySet()) {
+String[] partes = entry.getValue().split("\\|");
+tablaBuilder.append(entry.getKey()).append(":").append(partes[0]).append("\n");
+}
+String tablaServicios = tablaBuilder.toString().trim();
+byte[] tablaBytes = tablaServicios.getBytes();
+
+// Firmar la tabla con RSA
+long tiempoInicioFirma = System.nanoTime();
+Signature signature = Signature.getInstance("SHA256withRSA");
+signature.initSign(privateKeyRSA);
+signature.update(tablaBytes);
+byte[] firma = signature.sign();
+long tiempoFinFirma = System.nanoTime();
+tiempos.get("firma").add((tiempoFinFirma - tiempoInicioFirma) / 1_000_000);
+
+// Cifrar tabla con AES
+byte[] iv = new byte[16];
+new SecureRandom().nextBytes(iv);
+Cipher aesCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+aesCipher.init(Cipher.ENCRYPT_MODE, claveAES, new IvParameterSpec(iv));
+byte[] tablaCifrada = aesCipher.doFinal(tablaBytes);
+
+// Enviar IV, tabla cifrada y firma
+dos.write(iv);
+dos.writeInt(tablaCifrada.length);
+dos.write(tablaCifrada);
+
+dos.writeInt(firma.length);
+dos.write(firma);
+
+System.out.println("Tabla de servicios cifrada enviada al cliente (AES+RSA).");
+
+// Recibir consulta cifrada con AES
+byte[] ivConsulta = new byte[16];
+dis.readFully(ivConsulta);
+
+int longitudConsulta = dis.readInt();
+byte[] consultaCifrada = new byte[longitudConsulta];
+dis.readFully(consultaCifrada);
+System.out.println("Consulta cifrada recibida (AES).");
+
+// Descifrar consulta con AES
+aesCipher.init(Cipher.DECRYPT_MODE, claveAES, new IvParameterSpec(ivConsulta));
+byte[] consultaDescifrada = aesCipher.doFinal(consultaCifrada);
+String idServicio = new String(consultaDescifrada);
+System.out.println("Consulta procesada: " + idServicio);
+
+// Procesar consulta
+String respuesta = servicios.getOrDefault(idServicio, "-1|-1");
+
+// Cifrar respuesta con AES
+byte[] ivRespuesta = new byte[16];
+new SecureRandom().nextBytes(ivRespuesta);
+aesCipher.init(Cipher.ENCRYPT_MODE, claveAES, new IvParameterSpec(ivRespuesta));
+byte[] respuestaCifrada = aesCipher.doFinal(respuesta.getBytes());
+
+// Firmar respuesta
+signature.initSign(privateKeyRSA);
+signature.update(respuesta.getBytes());
+byte[] firmaRespuesta = signature.sign();
+
+// Enviar IV, respuesta cifrada y firma
+dos.write(ivRespuesta);
+dos.writeInt(respuestaCifrada.length);
+dos.write(respuestaCifrada);
+
+dos.writeInt(firmaRespuesta.length);
+dos.write(firmaRespuesta);
+
+System.out.println("Respuesta enviada al cliente (AES+RSA): " + respuesta);
+} catch (Exception e) {
+System.err.println("Error en el servidor: " + e.getMessage());
+e.printStackTrace();
+throw e;
+}
+}
+
+
 
         private PrivateKey cargarClavePrivada(String ruta) throws Exception {
             byte[] keyBytes = Files.readAllBytes(Paths.get(ruta));

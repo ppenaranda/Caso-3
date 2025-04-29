@@ -1,0 +1,19 @@
+Tipo,Tiempo (ms),Modo_Cifrado
+conexion,30,RSA
+conexion,1,RSA
+conexion,0,RSA
+conexion,0,RSA
+descifrado,2,RSA
+descifrado,2,RSA
+verificacion,3,RSA
+verificacion,3,RSA
+verificacion,4,RSA
+verificacion,4,RSA
+tiempo_total,22,RSA
+tiempo_total,277,RSA
+tiempo_total,24,RSA
+tiempo_total,116,RSA
+tiempo_total,26,RSA
+tiempo_total,168,RSA
+tiempo_total,26,RSA
+tiempo_total,230,RSA
